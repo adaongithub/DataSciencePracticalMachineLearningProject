@@ -1,0 +1,273 @@
+---
+output:   html_document
+geometry: margin=2cm
+graphics: yes
+---
+
+# Practical Machine Learning Project:
+# Predictive Model for Qualitative Activity Recognition of Weight Lifting Exercises
+
+-----------------------------------------------------------------------
+
+# Introduction
+
+We build a predictive model for data on human activity derived
+from a study that examined
+how people actually perform a simple weight lifting task [Velloso et al.].
+The people are instrumented with a number of sensors to measure the
+position and motion of the weight (a dumbbell) and of their body parts.
+These measurements give rise to 52 activity *monitors* which we will use
+as our predictor variables.
+The outcome variable we wish to predict is the type
+of motion that they are actually performing (the activity *quality*).
+In the data set this is a factor variable, *classe*, with 5 possible values:
+
+- A - Motion exactly according to the specification  
+- B - Throwing the elbows to the front  
+- C - Lifting the dumbbell only halfway  
+- D - Lowering the dumbbell only halfway  
+- E - Throwing the hips to the front  
+
+###Source of Data:
+
+**Citation:**  
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H.
+Qualitative Activity Recognition of Weight Lifting Exercises.
+Proceedings of 4th International Conference in Cooperation with
+SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013.
+
+**Paper:**  
+http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf
+
+**Training Data:**  
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+**Testing Data:**  
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+**Website:**  
+http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises
+
+# Preliminaries
+
+### Supporting functions
+We will use the function *pml_write_files()* to write out our final 
+model's predictions for the assignment test data to files in
+sub-directory "answers/" .
+```{r }
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("answers/problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+```
+
+### Load needed packages
+Note, we assume they have all been previously installed.
+
+```{r }
+library(doParallel)
+library(caret)
+library(randomForest)
+```
+
+### Run-time setup
+Some run-time setup to take advantage of support for parallel execution in R.
+```{r }
+registerDoParallel( cores=2 )
+```
+
+### Help ensure reproducibility of results
+Set a seed value for random number generation.
+```{r }
+set.seed( 314159265 )
+```
+
+# Read Data
+
+Read in the raw data from local .csv files.
+Note, we convert a number of extraneous values to "NA".
+```{r }
+train_raw <- read.csv( "../data/pml-training.csv",
+                       na.strings=c("NA", "", "#DIV/0!") )
+test_raw  <- read.csv( "../data/pml-testing.csv",
+                       na.strings=c("NA", "", "#DIV/0!") )
+```
+# Clean Data
+
+Remove any columns which have *only* NA's as values.
+```{r }
+train_cleaned_01 <- train_raw[ , colSums( is.na(train_raw)) == 0 ]
+test_cleaned_01  <- test_raw[  , colSums( is.na(test_raw))  == 0 ]
+```
+
+Remove the first  seven columns - they contain values which we will not
+be using in our predictive models; their names are:  
+
+```{r }
+print( names(train_cleaned_01)[1:7] )
+```
+
+```{r }
+train_cleaned_02 <- train_cleaned_01[ , -c(1:7) ]
+test_cleaned_02  <- test_cleaned_01[  , -c(1:7) ]
+```
+
+Remove from consideration for modeling any variables with "near zero" variance.
+```{r }
+NZVarianceVars <- nearZeroVar( train_cleaned_02, saveMetrics=TRUE )
+```
+We find that there are no such variables. NZVarianceVars$nzv is all
+FALSE so there are **no** NZV variables remaining in the training data set.
+```{r }
+print( any(NZVarianceVars$nzv) )
+```
+
+# Create Training Data Set and Validation Data Set
+
+Randomly split the training data we have here, *train_cleaned_02*,
+into two mutually disjoint, exhaustive sets:  
+
+1) the training data set, *train*, which we will use to develop our models  
+
+and  
+
+2) a data set, *validation*, which we will use to estimate our model's
+Out-of-Sample Error and cross-validate our models before
+finally running our chosen model on the assignment's test data
+in *test*, (set = to *test_cleaned_02* below) .
+
+The data set *train* will have 60% of the observations in *train_cleaned_02*
+and the data set *validation* will have the remaining 40% of the observations.
+This is a typical split.
+
+```{r }
+inTraining <- createDataPartition( y=train_cleaned_02$classe, times=1, p = .60)$Resample1
+training   <- train_cleaned_02[  inTraining, ]
+validation <- train_cleaned_02[ -inTraining, ]
+```
+
+We will use as our final test data set, *test*, our cleaned version of
+the data provided in the problem assignment (read in from the
+file "../data/pml-testing.csv").
+Note, that this data set is a true test data set, therefore, it does
+NOT have values for our outcome variable, *classe*.
+```{r }
+test       <- test_cleaned_02
+```
+
+# Build Model
+
+We build our model using the Random Forest (RF) method with the *classe*
+variable as the outcome variable and based on all other variables
+as predictors.
+
+Speifically, we use RF with 10-fold cross-validation.
+We use Random Forest because
+RF provides a good balance between accuracy and compute time.  We use
+RF with $\mathbf{k}$-fold cross-validation since this gives better accuracy
+(i.e., lower Out-of-Sample Error) because
+the resulting overall RF model is a composite of $k$ RF models each
+separately based on one of $k$ partitions of the training data.
+We use $\mathbf{10}$-fold cross-validation because our training set size
+(`r nrow(training)` observations)
+is large enough to take advantage of the lower estimation bias that
+a larger $k=10$ provides.
+
+### Performance issues
+Because of the long time required to compute large RF models, for
+convenience during our development, we compute a cached version of our
+model in *model_rf*. We save it in the file system and re-read it 
+from the file system on subsequent program executions.
+Note, we must be careful during our development to not inadvertantly
+change the model and forget to re-write the cache file.
+
+```{r }
+# Create a subdirectory for our cached model(s)
+if( ! file.exists( "./cachedModels" ) )
+{ dir.create( "./cachedModels" )
+}
+
+# If the cached model file does not exist (yet) then directly compute our model;
+# otherwise, if the cached file exists, just read it in - do not compute the
+# model.
+if ( ! file.exists("./cachedModels/model_rf_60PercentTrainingSet") )
+{ # compute our model
+  nFoldCtl <- trainControl( method="cv", number=10 )
+  model_rf <- train( classe ~ ., method="rf", data=training, trControl=nFoldCtl )
+  # Cache our newly computed model
+  saveRDS( model_rf, file="./cachedModels/model_rf_60PercentTrainingSet" )
+} else
+{
+  # Cache file exists -- read in the pre-computed cached model_rf
+  model_rf <- readRDS( file="./cachedModels/model_rf_60PercentTrainingSet" )
+}
+```
+### Resultant RF Model
+
+Looking at our model below we see that the accuracy for
+$mtry = `r model_rf$bestTune$mtry`$,
+the final value for the optimal RF model, is quite reasonable, namely,
+`r max(model_rf$results$Accuracy)` .
+Therefore, we will take this model as our best model and make an estimate of its
+Out-of-Sample Error below.
+```{r }
+print(model_rf)
+```
+
+# Estimate Model Out-of-Sample Error 
+
+Now we estimate the accuracy of *model_rf* by applying it to our validation
+set (*validation*) and looking at the resulting confusion matrix to estimate
+the model's Out-of-Sample Accuracy and Out-of-Sample Error.
+
+```{r }
+model_rf_predictions <- predict( model_rf, newdata=validation )
+
+cm <- confusionMatrix( model_rf_predictions, validation$classe )
+print( "Confusion Matrix for model_rf on our validation data set" )
+print( cm )
+
+out_of_sample_accuracy        <- cm$overall["Accuracy"]
+names(out_of_sample_accuracy) <- "Out-of-Sample Accuracy"
+
+out_of_sample_error           <- 1 - out_of_sample_accuracy 
+names(out_of_sample_error)    <- "Out-of-Sample Error"
+
+print( out_of_sample_error )
+print( out_of_sample_accuracy )
+```
+Our Out-of-Sample Error is estimated using cross-validation with our
+validation set (*validation*) to be
+`r out_of_sample_error` - with a corresponding Out-of-Sample Accuracy of
+`r out_of_sample_accuracy` .
+This bodes well for reasonably good performance on final test data.
+Therefore, we will use this model to submit our final predictions.
+
+
+## Compute the final model predictions
+We compute the predictions of our model for the final assignment test data
+data (from file "../data/pml-testing.csv").
+
+Now use our best model to compute our predictions, answers, for the
+assignment test data set.
+
+```{r }
+answers <- predict( model_rf, newdata=test )
+
+print( answers )
+```
+
+## Write out final answer files
+Write our answers out to a set of files for submission to the course grade 'bot.
+
+Upon comparison with the course grading 'bot we find agreement for all
+20 test cases.
+```{r }
+# Commented out here because we only do this one time
+# pml_write_files(answers)
+```
+
+
